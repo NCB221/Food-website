@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Database SQLite (dữ liệu thật, không đưa lên git)
+*.db
+*.db-wal
+*.db-shm
+
+# Ảnh người dùng tải lên
+uploads/
