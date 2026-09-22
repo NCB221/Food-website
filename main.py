@@ -1,11 +1,13 @@
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Literal, Optional
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -24,6 +26,68 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Food Review API", lifespan=lifespan)
+
+
+# ---------- An ninh: header và giới hạn tần suất ----------
+# script-src còn phải mở 'unsafe-inline' vì giao diện dùng thuộc tính onclick.
+# Dù vậy CSP vẫn chặn được việc nạp mã từ máy chủ lạ, là đường tấn công chính.
+CSP = (
+    "default-src 'self'; "
+    "img-src 'self' data:; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'"
+)
+
+HEADER_AN_NINH = {
+    "Content-Security-Policy": CSP,
+    # Trình duyệt không được tự đoán kiểu file khác với Content-Type khai báo
+    "X-Content-Type-Options": "nosniff",
+    # Không cho nhúng trang vào iframe của site khác (chống clickjacking)
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def them_header_an_ninh(request: Request, call_next):
+    phan_hoi = await call_next(request)
+    for ten, gia_tri in HEADER_AN_NINH.items():
+        phan_hoi.headers.setdefault(ten, gia_tri)
+    return phan_hoi
+
+
+# Chặn kịch bản một máy gửi dồn dập request ghi. Bộ đếm nằm trong bộ nhớ nên
+# chỉ đúng khi chạy 1 tiến trình - đủ cho quy mô hiện tại của ứng dụng.
+GIOI_HAN_GHI = 60          # số request ghi tối đa...
+CUA_SO_GIAY = 60           # ...trong mỗi khoảng thời gian này
+PHUONG_THUC_GHI = {"POST", "PUT", "PATCH", "DELETE"}
+_lich_su_ghi: dict[str, list[float]] = defaultdict(list)
+
+
+@app.middleware("http")
+async def gioi_han_tan_suat(request: Request, call_next):
+    if request.method not in PHUONG_THUC_GHI:
+        return await call_next(request)
+
+    ip = request.client.host if request.client else "khong-ro"
+    bay_gio = time.monotonic()
+    moc = _lich_su_ghi[ip]
+    # Bỏ các mốc đã ra khỏi cửa sổ thời gian, tránh danh sách phình vô hạn
+    moc[:] = [t for t in moc if bay_gio - t < CUA_SO_GIAY]
+
+    if len(moc) >= GIOI_HAN_GHI:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Bạn thao tác quá nhanh. Vui lòng thử lại sau ít phút."},
+            headers=HEADER_AN_NINH,
+        )
+
+    moc.append(bay_gio)
+    return await call_next(request)
 app.mount("/static", StaticFiles(directory=THU_MUC_GOC / "static"), name="static")
 
 # Ảnh nằm trên đĩa và được trả trực tiếp như file tĩnh -> trình duyệt cache được,
@@ -33,11 +97,25 @@ app.mount("/uploads", StaticFiles(directory=THU_MUC_UPLOAD), name="uploads")
 
 
 # ---------- Cấu trúc dữ liệu ----------
+# Chặn ngay ở tầng kiểm tra dữ liệu: không có max_length thì một request đơn lẻ
+# có thể nhét vài triệu ký tự vào database.
+DAI_TEN = 200
+DAI_DIA_CHI = 300
+DAI_MO_TA = 2000
+DAI_NOI_DUNG = 5000
+# Giá cao nhất chấp nhận được (1 tỷ đồng) - chặn số vô nghĩa
+GIA_TOI_DA = 1_000_000_000
+
+
 class QuanIn(BaseModel):
-    ten: str = Field(..., min_length=1, description="Tên quán")
+    ten: str = Field(..., min_length=1, max_length=DAI_TEN, description="Tên quán")
     loai: Literal["an", "uong"] = Field(..., description="'an' hoặc 'uong'")
-    dia_chi: str = Field(..., min_length=1, description="Địa chỉ quán")
-    mo_ta: str = Field("", description="Mô tả ngắn về quán")
+    dia_chi: str = Field(
+        ..., min_length=1, max_length=DAI_DIA_CHI, description="Địa chỉ quán"
+    )
+    mo_ta: str = Field(
+        "", max_length=DAI_MO_TA, description="Mô tả ngắn về quán"
+    )
 
 
 class Quan(QuanIn):
@@ -49,12 +127,16 @@ class Quan(QuanIn):
     anh_mon: Optional[str] = None
     so_review: int = 0
     diem_trung_binh: float = 0
+    so_anh: int = 0
+    # Trích bài review mới nhất, hiển thị ngay trên thẻ quán ở danh sách
+    review_nguoi_viet: Optional[str] = None
+    review_noi_dung: Optional[str] = None
 
 
 class MonAnIn(BaseModel):
-    ten_mon: str = Field(..., min_length=1)
-    gia: Optional[int] = Field(None, ge=0)
-    mo_ta: str = Field("")
+    ten_mon: str = Field(..., min_length=1, max_length=DAI_TEN)
+    gia: Optional[int] = Field(None, ge=0, le=GIA_TOI_DA)
+    mo_ta: str = Field("", max_length=DAI_MO_TA)
 
 
 class MonAn(MonAnIn):
@@ -64,20 +146,35 @@ class MonAn(MonAnIn):
 
 
 class ReviewIn(BaseModel):
-    nguoi_viet: str = Field("Ẩn danh", description="Tên người viết")
+    nguoi_viet: str = Field(
+        "Ẩn danh", max_length=DAI_TEN, description="Tên người viết"
+    )
     diem: int = Field(..., ge=1, le=5)
-    noi_dung: str = Field("", description="Nội dung bài review")
+    noi_dung: str = Field(
+        "", max_length=DAI_NOI_DUNG, description="Nội dung bài review"
+    )
 
 
 class Review(ReviewIn):
     id: int
     quan_id: int
     ngay_tao: str
+    # NULL khi bài review chưa từng được sửa
+    ngay_cap_nhat: Optional[str] = None
+
+
+class AnhQuan(BaseModel):
+    id: int
+    quan_id: int
+    ten_file: str
+    chu_thich: str = ""
+    ngay_tao: str
 
 
 class ChiTietQuan(Quan):
     menu: List[MonAn] = []
     reviews: List[Review] = []
+    thu_vien: List[AnhQuan] = []
 
 
 # Dùng lại ở nhiều chỗ: lấy quán kèm số review và điểm trung bình
@@ -87,7 +184,14 @@ SQL_QUAN_KEM_DIEM = """
            COALESCE(ROUND(AVG(r.diem), 1), 0) AS diem_trung_binh,
            (SELECT m.anh FROM menu_items m
              WHERE m.quan_id = q.id AND m.anh IS NOT NULL
-             ORDER BY m.id LIMIT 1)           AS anh_mon
+             ORDER BY m.id LIMIT 1)           AS anh_mon,
+           (SELECT COUNT(*) FROM anh_quan a
+             WHERE a.quan_id = q.id)          AS so_anh,
+           -- Trích bài review mới nhất để hiện ngay trên thẻ ngoài danh sách
+           (SELECT r2.nguoi_viet FROM reviews r2
+             WHERE r2.quan_id = q.id ORDER BY r2.id DESC LIMIT 1) AS review_nguoi_viet,
+           (SELECT r2.noi_dung FROM reviews r2
+             WHERE r2.quan_id = q.id ORDER BY r2.id DESC LIMIT 1) AS review_noi_dung
     FROM quan q
     LEFT JOIN reviews r ON r.quan_id = q.id
     {dieu_kien}
@@ -189,11 +293,15 @@ def chi_tiet_quan(quan_id: int):
         reviews = conn.execute(
             "SELECT * FROM reviews WHERE quan_id = ? ORDER BY id DESC", (quan_id,)
         ).fetchall()
+        thu_vien = conn.execute(
+            "SELECT * FROM anh_quan WHERE quan_id = ? ORDER BY id", (quan_id,)
+        ).fetchall()
 
     return {
         **dict(row),
         "menu": [dict(m) for m in menu],
         "reviews": [dict(r) for r in reviews],
+        "thu_vien": [dict(a) for a in thu_vien],
     }
 
 
@@ -219,12 +327,21 @@ def xoa_quan(quan_id: int):
         hang = conn.execute("SELECT anh FROM quan WHERE id = ?", (quan_id,)).fetchone()
         if not hang:
             raise HTTPException(status_code=404, detail="Không tìm thấy quán")
-        anh_can_xoa = [hang["anh"]] + [
-            r["anh"]
-            for r in conn.execute(
-                "SELECT anh FROM menu_items WHERE quan_id = ?", (quan_id,)
-            )
-        ]
+        anh_can_xoa = (
+            [hang["anh"]]
+            + [
+                r["anh"]
+                for r in conn.execute(
+                    "SELECT anh FROM menu_items WHERE quan_id = ?", (quan_id,)
+                )
+            ]
+            + [
+                r["ten_file"]
+                for r in conn.execute(
+                    "SELECT ten_file FROM anh_quan WHERE quan_id = ?", (quan_id,)
+                )
+            ]
+        )
         conn.execute("DELETE FROM quan WHERE id = ?", (quan_id,))
 
     # Chỉ xoá file sau khi database commit thành công
@@ -246,6 +363,22 @@ def them_mon(quan_id: int, mon: MonAnIn):
     return {"id": mon_id, "quan_id": quan_id, **mon.model_dump()}
 
 
+@app.put("/api/menu/{mon_id}", response_model=MonAn)
+def sua_mon(mon_id: int, mon: MonAnIn):
+    """Sửa tên, giá hoặc ghi chú của một món. Ảnh giữ nguyên."""
+    with ket_noi() as conn:
+        cur = conn.execute(
+            "UPDATE menu_items SET ten_mon = ?, gia = ?, mo_ta = ? WHERE id = ?",
+            (mon.ten_mon, mon.gia, mon.mo_ta, mon_id),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Không tìm thấy món")
+        row = conn.execute(
+            "SELECT * FROM menu_items WHERE id = ?", (mon_id,)
+        ).fetchone()
+    return dict(row)
+
+
 @app.delete("/api/menu/{mon_id}", status_code=204)
 def xoa_mon(mon_id: int):
     """Xoá một món khỏi menu, kèm file ảnh của món."""
@@ -262,7 +395,11 @@ def xoa_mon(mon_id: int):
 # ---------- API: Ảnh ----------
 # Tên bảng không thể truyền qua tham số "?" của SQL nên phải ghép chuỗi.
 # Chỉ cho phép đúng 2 giá trị này để tên bảng không bao giờ đến từ người dùng.
-BANG_CO_ANH = ("quan", "menu_items")
+BANG_CO_ANH = ("menu_items",)
+
+# Không giới hạn thì một request có thể nhét hàng nghìn ảnh và làm đầy đĩa
+SO_ANH_TOI_DA_MOI_LAN = 20
+SO_ANH_TOI_DA_MOI_QUAN = 100
 
 
 async def _gan_anh(bang: str, ban_ghi_id: int, file: UploadFile, tien_to: str) -> dict:
@@ -304,15 +441,17 @@ def _go_anh(bang: str, ban_ghi_id: int) -> None:
     xoa_anh(hang["anh"])
 
 
-@app.post("/api/quan/{quan_id}/anh")
-async def tai_anh_quan(quan_id: int, file: UploadFile = File(...)):
-    """Tải ảnh đại diện cho quán. Ảnh cũ (nếu có) sẽ bị thay thế."""
-    return await _gan_anh("quan", quan_id, file, "quan")
-
-
 @app.delete("/api/quan/{quan_id}/anh", status_code=204)
-def xoa_anh_quan(quan_id: int):
-    _go_anh("quan", quan_id)
+def bo_anh_bia(quan_id: int):
+    """Bỏ ảnh bìa của quán.
+
+    KHÔNG xoá file: ảnh bìa luôn là một ảnh trong thư viện, xoá file ở đây
+    sẽ làm hỏng ảnh đó trong thư viện. Muốn xoá hẳn thì dùng
+    DELETE /api/thu-vien/{anh_id}.
+    """
+    with ket_noi() as conn:
+        _kiem_tra_quan_ton_tai(conn, quan_id)
+        conn.execute("UPDATE quan SET anh = NULL WHERE id = ?", (quan_id,))
 
 
 @app.post("/api/menu/{mon_id}/anh")
@@ -324,6 +463,131 @@ async def tai_anh_mon(mon_id: int, file: UploadFile = File(...)):
 @app.delete("/api/menu/{mon_id}/anh", status_code=204)
 def xoa_anh_mon(mon_id: int):
     _go_anh("menu_items", mon_id)
+
+
+# ---------- API: Thư viện ảnh của quán ----------
+@app.get("/api/quan/{quan_id}/thu-vien", response_model=List[AnhQuan])
+def danh_sach_anh_quan(quan_id: int):
+    """Toàn bộ ảnh trong thư viện của một quán."""
+    with ket_noi() as conn:
+        _kiem_tra_quan_ton_tai(conn, quan_id)
+        rows = conn.execute(
+            "SELECT * FROM anh_quan WHERE quan_id = ? ORDER BY id", (quan_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/quan/{quan_id}/thu-vien", response_model=List[AnhQuan], status_code=201)
+async def them_anh_quan(quan_id: int, files: List[UploadFile] = File(...)):
+    """Tải lên một hoặc nhiều ảnh về không gian quán.
+
+    Ảnh đầu tiên của quán tự động trở thành ảnh bìa, để thẻ ngoài danh sách
+    có hình ngay mà người dùng không phải thao tác thêm.
+    """
+    if len(files) > SO_ANH_TOI_DA_MOI_LAN:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Chỉ tải lên tối đa {SO_ANH_TOI_DA_MOI_LAN} ảnh mỗi lần.",
+        )
+
+    with ket_noi() as conn:
+        _kiem_tra_quan_ton_tai(conn, quan_id)
+        so_hien_co = conn.execute(
+            "SELECT COUNT(*) AS n FROM anh_quan WHERE quan_id = ?", (quan_id,)
+        ).fetchone()["n"]
+    if so_hien_co + len(files) > SO_ANH_TOI_DA_MOI_QUAN:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Mỗi quán chỉ lưu tối đa {SO_ANH_TOI_DA_MOI_QUAN} ảnh "
+                f"(hiện có {so_hien_co})."
+            ),
+        )
+
+    ngay_tao = _bay_gio()
+    da_luu: List[str] = []
+    try:
+        for f in files:
+            da_luu.append(await luu_anh(f, f"quan{quan_id}"))
+    except Exception:
+        # Một file hỏng giữa chừng -> bỏ hết, không để lại ảnh mồ côi trên đĩa
+        for ten in da_luu:
+            xoa_anh(ten)
+        raise
+
+    try:
+        with ket_noi() as conn:
+            for ten in da_luu:
+                conn.execute(
+                    """INSERT INTO anh_quan (quan_id, ten_file, chu_thich, ngay_tao)
+                       VALUES (?, ?, '', ?)""",
+                    (quan_id, ten, ngay_tao),
+                )
+            chua_co_bia = conn.execute(
+                "SELECT anh FROM quan WHERE id = ?", (quan_id,)
+            ).fetchone()["anh"] is None
+            if chua_co_bia:
+                conn.execute(
+                    "UPDATE quan SET anh = ? WHERE id = ?", (da_luu[0], quan_id)
+                )
+            rows = conn.execute(
+                "SELECT * FROM anh_quan WHERE quan_id = ? ORDER BY id", (quan_id,)
+            ).fetchall()
+    except Exception:
+        for ten in da_luu:
+            xoa_anh(ten)
+        raise
+
+    return [dict(r) for r in rows]
+
+
+@app.put("/api/quan/{quan_id}/anh-bia/{anh_id}", response_model=Quan)
+def chon_anh_bia(quan_id: int, anh_id: int):
+    """Chọn một ảnh trong thư viện làm ảnh bìa của quán."""
+    with ket_noi() as conn:
+        _kiem_tra_quan_ton_tai(conn, quan_id)
+        hang = conn.execute(
+            "SELECT ten_file FROM anh_quan WHERE id = ? AND quan_id = ?",
+            (anh_id, quan_id),
+        ).fetchone()
+        if not hang:
+            raise HTTPException(
+                status_code=404, detail="Ảnh không thuộc thư viện của quán này"
+            )
+        conn.execute(
+            "UPDATE quan SET anh = ? WHERE id = ?", (hang["ten_file"], quan_id)
+        )
+        row = _lay_quan(conn, quan_id)
+    return dict(row)
+
+
+@app.delete("/api/thu-vien/{anh_id}", status_code=204)
+def xoa_anh_thu_vien(anh_id: int):
+    """Xoá một ảnh khỏi thư viện, kèm file trên đĩa."""
+    with ket_noi() as conn:
+        hang = conn.execute(
+            "SELECT quan_id, ten_file FROM anh_quan WHERE id = ?", (anh_id,)
+        ).fetchone()
+        if not hang:
+            raise HTTPException(status_code=404, detail="Không tìm thấy ảnh")
+        conn.execute("DELETE FROM anh_quan WHERE id = ?", (anh_id,))
+
+        # Ảnh vừa xoá đang là bìa -> lấy ảnh còn lại trong thư viện thay thế,
+        # hết ảnh thì để trống chứ không trỏ vào file đã mất.
+        quan = conn.execute(
+            "SELECT anh FROM quan WHERE id = ?", (hang["quan_id"],)
+        ).fetchone()
+        if quan and quan["anh"] == hang["ten_file"]:
+            con_lai = conn.execute(
+                "SELECT ten_file FROM anh_quan WHERE quan_id = ? ORDER BY id LIMIT 1",
+                (hang["quan_id"],),
+            ).fetchone()
+            conn.execute(
+                "UPDATE quan SET anh = ? WHERE id = ?",
+                (con_lai["ten_file"] if con_lai else None, hang["quan_id"]),
+            )
+
+    xoa_anh(hang["ten_file"])
 
 
 # ---------- API: Review ----------
@@ -346,6 +610,26 @@ def them_review(quan_id: int, review: ReviewIn):
         "ngay_tao": ngay_tao,
         **{**review.model_dump(), "nguoi_viet": nguoi_viet},
     }
+
+
+@app.put("/api/reviews/{review_id}", response_model=Review)
+def sua_review(review_id: int, review: ReviewIn):
+    """Sửa bài review. Mỗi lần sửa ghi lại mốc thời gian vào ngay_cap_nhat."""
+    ngay_cap_nhat = _bay_gio()
+    nguoi_viet = review.nguoi_viet.strip() or "Ẩn danh"
+    with ket_noi() as conn:
+        cur = conn.execute(
+            """UPDATE reviews
+                  SET nguoi_viet = ?, diem = ?, noi_dung = ?, ngay_cap_nhat = ?
+                WHERE id = ?""",
+            (nguoi_viet, review.diem, review.noi_dung, ngay_cap_nhat, review_id),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Không tìm thấy review")
+        row = conn.execute(
+            "SELECT * FROM reviews WHERE id = ?", (review_id,)
+        ).fetchone()
+    return dict(row)
 
 
 @app.delete("/api/reviews/{review_id}", status_code=204)

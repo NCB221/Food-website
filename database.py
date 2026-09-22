@@ -42,10 +42,23 @@ CREATE TABLE IF NOT EXISTS reviews (
     nguoi_viet TEXT    NOT NULL DEFAULT 'Ẩn danh',
     diem       INTEGER NOT NULL CHECK (diem BETWEEN 1 AND 5),
     noi_dung   TEXT    NOT NULL DEFAULT '',
-    ngay_tao   TEXT    NOT NULL
+    ngay_tao   TEXT    NOT NULL,
+    -- NULL khi bài review chưa từng được sửa
+    ngay_cap_nhat TEXT
+);
+
+-- Bảng thư viện ảnh: nhiều ảnh không gian / món của một quán.
+-- Cột anh của bảng quan vẫn giữ vai trò ẢNH BÌA hiển thị ở thẻ danh sách.
+CREATE TABLE IF NOT EXISTS anh_quan (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    quan_id  INTEGER NOT NULL REFERENCES quan(id) ON DELETE CASCADE,
+    ten_file TEXT    NOT NULL,
+    chu_thich TEXT   NOT NULL DEFAULT '',
+    ngay_tao TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_quan_loai       ON quan(loai);
+CREATE INDEX IF NOT EXISTS idx_anh_quan        ON anh_quan(quan_id);
 CREATE INDEX IF NOT EXISTS idx_menu_quan       ON menu_items(quan_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_quan    ON reviews(quan_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_diem    ON reviews(diem);
@@ -142,6 +155,9 @@ def khoi_tao_db() -> int:
         # Database tạo trước khi có tính năng ảnh sẽ thiếu 2 cột này
         _them_cot_neu_thieu(conn, "quan", "anh", "TEXT")
         _them_cot_neu_thieu(conn, "menu_items", "anh", "TEXT")
+
+        # Database tạo trước khi có tính năng sửa review sẽ thiếu cột này
+        _them_cot_neu_thieu(conn, "reviews", "ngay_cap_nhat", "TEXT")
 
         # WAL: nhiều người ĐỌC song song khi 1 người đang GHI. Chỉ cần đặt 1 lần.
         conn.execute("PRAGMA journal_mode = WAL")

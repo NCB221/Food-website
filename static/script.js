@@ -2,8 +2,16 @@
 const TEN_LOAI = { an: "Quán ăn", uong: "Quán đồ uống" };
 const ICON_LOAI = { an: "🍜", uong: "🧋" };
 
-let loaiHienTai = "an";   // loại đang xem ở màn danh sách
+let loaiHienTai = null;   // null = tất cả, hoặc "an" / "uong"
 let quanHienTai = null;   // id quán đang xem ở màn chi tiết
+let monDangSua = null;    // id món đang mở form sửa trong menu
+let reviewDangSua = null; // id bài review đang mở form sửa
+
+// Danh sách quán đang giữ trong bộ nhớ. Ô tìm kiếm và các tab sắp xếp lọc
+// ngay trên mảng này, không gọi lại máy chủ sau mỗi phím gõ.
+let danhSachGoc = [];
+let tuKhoa = "";
+let sapXep = "moi";
 
 // Phải khớp với DUNG_LUONG_TOI_DA trong anh.py: chặn sớm ở trình duyệt để
 // người dùng biết ngay, không phải chờ tải hết 20 MB lên rồi mới nhận lỗi.
@@ -12,11 +20,19 @@ const TEN_MON_MAC_DINH = "Món đặc trưng";
 
 // ===================== Tiện ích =====================
 
-// Chặn HTML injection từ dữ liệu người dùng nhập
+// Chặn HTML injection từ dữ liệu người dùng nhập.
+//
+// Phải escape CẢ HAI loại dấu nháy, không chỉ < > &. Cách cũ (gán textContent
+// rồi đọc innerHTML) để lọt dấu " nguyên vẹn, nên một cái tên như
+//     Quán X" onmouseover="mã_độc()
+// thoát ra khỏi thuộc tính HTML và chạy được JavaScript.
 function thoat(text) {
-    const div = document.createElement("div");
-    div.textContent = text ?? "";
-    return div.innerHTML;
+    return String(text ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
 }
 
 function dinhDangGia(gia) {
@@ -26,7 +42,13 @@ function dinhDangGia(gia) {
 }
 
 function veSao(diem) {
-    return "⭐".repeat(diem) + "☆".repeat(5 - diem);
+    return "★".repeat(diem) + "☆".repeat(5 - diem);
+}
+
+/** Chữ cái đầu của tên người viết, dùng làm avatar tròn trên thẻ quán. */
+function chuDau(ten) {
+    const t = (ten || "?").trim();
+    return t ? t[0] : "?";
 }
 
 function hienThongBao(noiDung, loai = "success") {
@@ -34,15 +56,6 @@ function hienThongBao(noiDung, loai = "success") {
     el.className = `toast align-items-center text-white border-0 bg-${loai}`;
     document.getElementById("thong-bao-noi-dung").textContent = noiDung;
     bootstrap.Toast.getOrCreateInstance(el, { delay: 3000 }).show();
-}
-
-/** Ô ảnh giữ chỗ khi bản ghi chưa có ảnh. */
-function khungAnh(tenFile, cao, chuThich) {
-    return tenFile
-        ? `<img src="/uploads/${encodeURIComponent(tenFile)}" alt="${chuThich}"
-                class="anh-bia" style="height:${cao}" loading="lazy">`
-        : `<div class="anh-trong d-flex align-items-center justify-content-center"
-                style="height:${cao}">🖼️</div>`;
 }
 
 /** Gọi API, tự báo lỗi nếu thất bại. Trả về null khi lỗi. */
@@ -69,96 +82,145 @@ async function goiApi(url, tuyChon = {}) {
     }
 }
 
-/** Hiện đúng 1 màn hình, ẩn các màn còn lại. */
+/** Hiện đúng 1 màn hình, ẩn màn còn lại. */
 function hienMan(id) {
-    ["man-trang-chu", "man-danh-sach", "man-chi-tiet"].forEach(m => {
+    ["man-danh-sach", "man-chi-tiet"].forEach(m => {
         document.getElementById(m).hidden = (m !== id);
     });
     window.scrollTo(0, 0);
 }
 
-// ===================== Màn 1: Trang chủ =====================
-
-async function moTrangChu() {
-    hienMan("man-trang-chu");
-    quanHienTai = null;
-    await capNhatThongKe();
-}
+// ===================== Màn danh sách =====================
 
 async function capNhatThongKe() {
     const tk = await goiApi("/api/thong-ke");
     if (!tk) return;
-    document.getElementById("dem-quan-an").textContent = `${tk.quan_an} quán`;
-    document.getElementById("dem-quan-uong").textContent = `${tk.quan_uong} quán`;
+    document.getElementById("dem-quan-an").textContent = tk.quan_an;
+    document.getElementById("dem-quan-uong").textContent = tk.quan_uong;
+    document.getElementById("dem-review").textContent = tk.tong_review;
     document.getElementById("thong-ke").textContent =
         `${tk.quan_an + tk.quan_uong} địa điểm · ${tk.tong_review} bài review`;
 }
 
-// ===================== Màn 2: Danh sách quán =====================
+/** Tô đậm mục đang chọn ở sidebar, dải đen trên cùng và ô lọc danh mục. */
+function danhDauDangChon(loai) {
+    document.querySelectorAll("#menu-sidebar .muc-sidebar").forEach(a => {
+        a.classList.toggle("dang-chon", (a.dataset.loai || "") === (loai || ""));
+    });
+    const nhan = { "": "Khám Phá", an: "Quán Ăn", uong: "Quán Đồ Uống" }[loai || ""];
+    document.querySelectorAll(".tab-den").forEach(a => {
+        a.classList.toggle("dang-chon", a.textContent.trim() === nhan);
+    });
+    document.getElementById("loc-loai").value = loai || "";
+}
 
 async function moDanhSach(loai) {
-    loaiHienTai = loai;
+    loaiHienTai = loai || null;
     hienMan("man-danh-sach");
     dongFormQuan();
-
-    document.getElementById("duong-dan-loai").textContent = TEN_LOAI[loai];
-    document.getElementById("tieu-de-danh-sach").textContent =
-        `${ICON_LOAI[loai]} ${TEN_LOAI[loai]}`;
+    danhDauDangChon(loaiHienTai);
 
     const khung = document.getElementById("danh-sach-quan");
-    khung.innerHTML = `<p class="text-secondary">Đang tải...</p>`;
+    khung.innerHTML = `<div class="khong-co-gi">Đang tải...</div>`;
 
-    const ds = await goiApi(`/api/quan?loai=${loai}`);
+    const ds = await goiApi(loaiHienTai ? `/api/quan?loai=${loaiHienTai}` : "/api/quan");
     if (!ds) { khung.innerHTML = ""; return; }
 
+    danhSachGoc = ds;
+    veLuoiQuan();
+    await capNhatThongKe();
+}
+
+/** Áp từ khoá tìm kiếm và kiểu sắp xếp lên danh sách đang giữ, rồi vẽ lại lưới. */
+function veLuoiQuan() {
+    const khung = document.getElementById("danh-sach-quan");
+
+    const tu = tuKhoa.trim().toLowerCase();
+    let ds = danhSachGoc.filter(q =>
+        !tu ||
+        q.ten.toLowerCase().includes(tu) ||
+        q.dia_chi.toLowerCase().includes(tu) ||
+        (q.mo_ta || "").toLowerCase().includes(tu)
+    );
+
+    if (sapXep === "diem") {
+        ds = [...ds].sort((a, b) => b.diem_trung_binh - a.diem_trung_binh);
+    } else if (sapXep === "review") {
+        ds = [...ds].sort((a, b) => b.so_review - a.so_review);
+    }
+
     if (ds.length === 0) {
-        khung.innerHTML = `
-            <div class="col-12">
-                <div class="alert alert-light border text-center py-4">
-                    Chưa có ${TEN_LOAI[loai].toLowerCase()} nào.
-                    Bấm <strong>“+ Thêm quán mới”</strong> để thêm địa điểm đầu tiên.
-                </div>
-            </div>`;
+        khung.innerHTML = `<div class="khong-co-gi">${
+            tu
+                ? `Không tìm thấy địa điểm nào khớp với “${thoat(tuKhoa)}”.`
+                : "Chưa có địa điểm nào. Bấm <strong>+ Thêm quán</strong> ở trên để bắt đầu."
+        }</div>`;
         return;
     }
 
     khung.innerHTML = ds.map(theQuan).join("");
 }
 
+function locTheoTuKhoa(gia_tri) {
+    tuKhoa = gia_tri;
+    if (document.getElementById("man-danh-sach").hidden) {
+        hienMan("man-danh-sach");
+    }
+    veLuoiQuan();
+}
+
+/** Một thẻ quán trong lưới: ảnh, tên, địa chỉ, trích review, chân thẻ. */
 function theQuan(q) {
+    const anh = q.anh || q.anh_mon;
+    const khungAnh = anh
+        ? `<img src="/uploads/${encodeURIComponent(anh)}" class="anh-the"
+                alt="${thoat(q.ten)}" loading="lazy">`
+        : `<div class="anh-trong">${ICON_LOAI[q.loai]}</div>`;
+
+    const trich = q.review_nguoi_viet
+        ? `<div class="trich-review">
+               <div class="anh-dai-dien">${thoat(chuDau(q.review_nguoi_viet))}</div>
+               <div class="noi-dung-trich">
+                   <span class="ten-nguoi-viet">${thoat(q.review_nguoi_viet)}</span>${
+                       q.review_noi_dung
+                           ? thoat(q.review_noi_dung)
+                           : "<em>đã chấm điểm quán này</em>"
+                   }
+               </div>
+           </div>`
+        : `<div class="chua-review">Chưa có bài review nào</div>`;
+
     const diem = q.so_review > 0
-        ? `<span class="text-warning">${veSao(Math.round(q.diem_trung_binh))}</span>
-           <span class="text-secondary small">${q.diem_trung_binh}/5 · ${q.so_review} review</span>`
-        : `<span class="text-secondary small">Chưa có review</span>`;
+        ? `<span class="diem-the">${q.diem_trung_binh}</span>`
+        : `<span class="diem-the trong">—</span>`;
 
     return `
-        <div class="col-md-6 col-lg-4">
-            <div class="card the-quan h-100 shadow-sm" role="button"
-                 onclick="moChiTiet(${q.id})">
-                ${khungAnh(q.anh || q.anh_mon, "160px", thoat(q.ten))}
-                <div class="card-body">
-                    <h5 class="card-title mb-1">${thoat(q.ten)}</h5>
-                    <p class="text-secondary small mb-2">📍 ${thoat(q.dia_chi)}</p>
-                    <div class="mb-2">${diem}</div>
-                    <p class="card-text small text-truncate-2">
-                        ${thoat(q.mo_ta) || "<em class='text-secondary'>Chưa có mô tả</em>"}
-                    </p>
-                </div>
-                <div class="card-footer bg-white border-top-0 text-end">
-                    <span class="small text-danger">Xem chi tiết →</span>
-                </div>
+        <article class="the-quan" onclick="moChiTiet(${q.id})">
+            ${khungAnh}
+            <div class="than-the">
+                <div class="ten-quan">${thoat(q.ten)}</div>
+                <div class="dia-chi-the">${thoat(q.dia_chi)}</div>
+                ${trich}
             </div>
-        </div>`;
+            <div class="chan-the">
+                <span>💬 ${q.so_review}</span>
+                <span>📷 ${q.so_anh}</span>
+                ${diem}
+            </div>
+        </article>`;
 }
 
 // ---- Form thêm / sửa quán ----
 
 function moFormThemQuan() {
+    hienMan("man-danh-sach");
     document.getElementById("tieu-de-form-quan").textContent = "Thêm quán mới";
     document.getElementById("form-quan").reset();
     document.getElementById("quan-dang-sua").value = "";
-    document.getElementById("q-loai").value = loaiHienTai;
+    document.getElementById("q-loai").value = loaiHienTai || "an";
     boChonAnhMon();
+    document.getElementById("khung-anh-quan-moi").hidden = false;
+    document.getElementById("khung-mon-dau-tien").hidden = false;
     document.getElementById("khung-form-quan").hidden = false;
     document.getElementById("q-ten").focus();
 }
@@ -167,8 +229,12 @@ async function moFormSuaQuan(id) {
     const q = await goiApi(`/api/quan/${id}`);
     if (!q) return;
 
+    document.getElementById("form-quan").reset();
     document.getElementById("tieu-de-form-quan").textContent = `Sửa: ${q.ten}`;
     document.getElementById("quan-dang-sua").value = q.id;
+    // Khối ảnh và món chỉ dành cho quán mới; khi sửa thì quản lý ở màn chi tiết
+    document.getElementById("khung-anh-quan-moi").hidden = true;
+    document.getElementById("khung-mon-dau-tien").hidden = true;
     document.getElementById("q-ten").value = q.ten;
     document.getElementById("q-loai").value = q.loai;
     document.getElementById("q-dia-chi").value = q.dia_chi;
@@ -230,22 +296,25 @@ function boChonAnhMon() {
     if (khung) khung.hidden = true;
 }
 
-/** Thêm 1 món kèm ảnh cho quán vừa lưu. Trả về true nếu ảnh đã lên máy chủ.
+/** Thêm 1 món (kèm ảnh nếu có) cho quán vừa lưu.
 
     Làm 2 bước vì ảnh luôn thuộc về một bản ghi đã có: tạo món trước để
     lấy id, rồi mới gắn ảnh vào id đó.
  */
-async function themMonKemAnh(quanId, tenMon, file) {
+async function themMonKemAnh(quanId, tenMon, gia, file) {
     const mon = await goiApi(`/api/quan/${quanId}/menu`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             ten_mon: tenMon || TEN_MON_MAC_DINH,
-            gia: null,
+            gia: gia,
             mo_ta: "",
         }),
     });
     if (!mon) return false;
+
+    // Món không kèm ảnh thì đã xong ngay ở bước trên
+    if (!file) return true;
 
     const form = new FormData();
     form.append("file", file);
@@ -270,8 +339,13 @@ document.getElementById("form-quan").addEventListener("submit", async (e) => {
     };
 
     // Lấy trước khi đóng form vì reset() sẽ xoá sạch các ô nhập
+    const anhQuan = Array.from(document.getElementById("q-anh-quan").files || []);
     const anhMon = document.getElementById("q-anh-mon").files[0] || null;
     const tenMon = document.getElementById("q-ten-mon").value.trim();
+    const giaMonRaw = document.getElementById("q-gia-mon").value;
+    const giaMon = giaMonRaw === "" ? null : parseInt(giaMonRaw, 10);
+    // Chỉ tạo món khi người dùng có nhập ít nhất một trong ba ô
+    const coMon = Boolean(tenMon || giaMon !== null || anhMon);
 
     const kq = await goiApi(id ? `/api/quan/${id}` : "/api/quan", {
         method: id ? "PUT" : "POST",
@@ -280,30 +354,37 @@ document.getElementById("form-quan").addEventListener("submit", async (e) => {
     });
     if (!kq) return;
 
-    // Quán phải tồn tại trước thì món và ảnh mới có chỗ để gắn vào
-    let daCoAnh = false;
-    if (anhMon) {
-        hienThongBao("Đang tải ảnh món lên...", "secondary");
-        daCoAnh = await themMonKemAnh(kq.id, tenMon, anhMon);
+    if (anhQuan.length > 0 && !id) {
+        const form = new FormData();
+        anhQuan.forEach(f => form.append("files", f));
+        hienThongBao(`Đang tải ${anhQuan.length} ảnh quán lên...`, "secondary");
+        await goiApi(`/api/quan/${kq.id}/thu-vien`, { method: "POST", body: form });
     }
 
-    if (!anhMon || daCoAnh) {
+    // Quán phải tồn tại trước thì món và ảnh mới có chỗ để gắn vào.
+    // Khi sửa quán (id đã có) thì không tạo thêm món, tránh nhân bản mỗi lần lưu.
+    let daLuuMon = false;
+    if (coMon && !id) {
+        if (anhMon) hienThongBao("Đang tải ảnh món lên...", "secondary");
+        daLuuMon = await themMonKemAnh(kq.id, tenMon, giaMon, anhMon);
+    }
+
+    if (!coMon || daLuuMon) {
         hienThongBao(
             id
                 ? "Đã cập nhật quán."
-                : daCoAnh
-                    ? "Đã thêm quán mới kèm ảnh món."
+                : daLuuMon
+                    ? "Đã thêm quán mới kèm món."
                     : "Đã thêm quán mới."
         );
     }
     dongFormQuan();
     // Nếu đổi loại khi sửa, nhảy sang danh sách của loại mới
     await moDanhSach(duLieu.loai);
-    await capNhatThongKe();
 });
 
 async function xoaQuan(id, ten) {
-    if (!confirm(`Xoá quán "${ten}"?\n\nToàn bộ menu và bài review của quán này cũng sẽ bị xoá.`))
+    if (!confirm(`Xoá quán "${ten}"?\n\nToàn bộ menu, ảnh và bài review của quán này cũng sẽ bị xoá.`))
         return;
 
     const kq = await goiApi(`/api/quan/${id}`, { method: "DELETE" });
@@ -311,17 +392,16 @@ async function xoaQuan(id, ten) {
 
     hienThongBao("Đã xoá quán.");
     await moDanhSach(loaiHienTai);
-    await capNhatThongKe();
 }
 
-// ===================== Màn 3: Chi tiết quán =====================
+// ===================== Màn chi tiết quán =====================
 
 async function moChiTiet(id) {
     quanHienTai = id;
     hienMan("man-chi-tiet");
 
     const khung = document.getElementById("chi-tiet-noi-dung");
-    khung.innerHTML = `<p class="text-secondary">Đang tải...</p>`;
+    khung.innerHTML = `<div class="khong-co-gi">Đang tải...</div>`;
 
     const q = await goiApi(`/api/quan/${id}`);
     if (!q) { khung.innerHTML = ""; return; }
@@ -336,82 +416,81 @@ async function moChiTiet(id) {
 }
 
 function htmlChiTiet(q) {
-    const diemTb = q.so_review > 0
-        ? `<span class="text-warning fs-5">${veSao(Math.round(q.diem_trung_binh))}</span>
-           <span class="text-secondary">${q.diem_trung_binh}/5 · ${q.so_review} bài review</span>`
-        : `<span class="text-secondary">Chưa có bài review nào</span>`;
+    const diem = q.so_review > 0
+        ? `<span class="diem-lon">${q.diem_trung_binh}</span>
+           <span class="sao-vang">${veSao(Math.round(q.diem_trung_binh))}</span>
+           <span class="ghi-chu">${q.so_review} bài review</span>`
+        : `<span class="ghi-chu">Chưa có bài review nào</span>`;
+
+    const bia = q.anh
+        ? `<img src="/uploads/${encodeURIComponent(q.anh)}" class="anh-bia-lon"
+                alt="${thoat(q.ten)}">`
+        : `<div class="anh-bia-trong">${ICON_LOAI[q.loai]}</div>`;
 
     return `
-    <!-- Thông tin quán -->
-    <div class="card shadow-sm mb-4">
-        ${khungAnh(q.anh, "260px", thoat(q.ten))}
-        <div class="card-body">
-            <div class="mb-3 d-flex align-items-center gap-2 flex-wrap">
-                <label class="btn btn-sm btn-outline-secondary mb-0">
-                    ${q.anh ? "Đổi ảnh" : "+ Thêm ảnh quán"}
-                    <input type="file" accept="image/*" class="d-none"
-                           onchange="taiAnh('quan', ${q.id}, this)">
-                </label>
-                ${q.anh ? `<button class="btn btn-sm btn-outline-danger"
-                                   onclick="goAnh('quan', ${q.id})">Xoá ảnh</button>` : ""}
-                <span class="small text-secondary">Tối đa 8 MB, tự nén còn 1200px</span>
-            </div>
+    <div class="hop-trang">
+        ${bia}
+        <div class="than-hop">
             <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
                 <div>
-                    <h2 class="mb-1">${ICON_LOAI[q.loai]} ${thoat(q.ten)}</h2>
-                    <span class="badge bg-secondary">${TEN_LOAI[q.loai]}</span>
+                    <h1 class="ten-quan-lon">${thoat(q.ten)}</h1>
+                    <span class="nhan-loai">${ICON_LOAI[q.loai]} ${TEN_LOAI[q.loai]}</span>
                 </div>
                 <div class="d-flex gap-2">
-                    <button class="btn btn-sm btn-outline-secondary"
-                            onclick="moFormSuaQuan(${q.id})">Sửa</button>
-                    <button class="btn btn-sm btn-outline-danger"
-                            onclick="xoaQuan(${q.id}, '${thoat(q.ten).replace(/'/g, "\\'")}')">Xoá</button>
+                    <label class="nut-vien mb-0" style="cursor:pointer">
+                        📷 Đăng ảnh quán
+                        <input type="file" accept="image/*" multiple class="d-none"
+                               onchange="taiAnhQuan(${q.id}, this)">
+                    </label>
+                    ${q.anh ? `<button class="nut-vien" onclick="boAnhBia(${q.id})">Bỏ ảnh bìa</button>` : ""}
+                    <button class="nut-vien" onclick="moFormSuaQuan(${q.id})">Sửa</button>
+                    <button class="nut-vien" data-xoa-quan="${q.id}" data-ten="${thoat(q.ten)}">Xoá</button>
                 </div>
             </div>
             <hr>
-            <p class="mb-2"><strong>📍 Địa chỉ:</strong> ${thoat(q.dia_chi)}</p>
-            <p class="mb-2">${diemTb}</p>
-            ${q.mo_ta ? `<p class="mb-0 text-secondary">${thoat(q.mo_ta)}</p>` : ""}
+            <p class="mb-2">📍 <strong>Địa chỉ:</strong> ${thoat(q.dia_chi)}</p>
+            <p class="mb-2">${diem}</p>
+            ${q.mo_ta ? `<p class="mb-0 ghi-chu">${thoat(q.mo_ta)}</p>` : ""}
         </div>
     </div>
 
-    <div class="row g-4">
+    ${khoiThuVien(q)}
+
+    <div class="cot-doi">
         <!-- MENU -->
-        <div class="col-lg-5">
-            <div class="card shadow-sm h-100">
-                <div class="card-header bg-white fw-semibold">📋 Menu</div>
-                <ul class="list-group list-group-flush" id="khung-menu">
-                    ${q.menu.length === 0
-                        ? `<li class="list-group-item text-secondary">Chưa có món nào trong menu.</li>`
-                        : q.menu.map(dongMenu).join("")}
-                </ul>
-                <div class="card-body border-top">
-                    <form id="form-mon" class="row g-2">
-                        <div class="col-7">
-                            <input type="text" class="form-control form-control-sm"
-                                   id="m-ten" placeholder="Tên món" required>
-                        </div>
-                        <div class="col-5">
-                            <input type="number" class="form-control form-control-sm"
-                                   id="m-gia" placeholder="Giá (VND)" min="0">
-                        </div>
-                        <div class="col-12">
-                            <input type="text" class="form-control form-control-sm"
-                                   id="m-mo-ta" placeholder="Ghi chú (không bắt buộc)">
-                        </div>
-                        <div class="col-12">
-                            <button class="btn btn-sm btn-outline-danger w-100">+ Thêm món</button>
-                        </div>
-                    </form>
-                </div>
+        <div class="hop-trang">
+            <div class="dau-hop">📋 Menu</div>
+            <div id="khung-menu">
+                ${q.menu.length === 0
+                    ? `<div class="than-hop ghi-chu">Chưa có món nào trong menu.</div>`
+                    : q.menu.map(dongMenu).join("")}
+            </div>
+            <div class="than-hop" style="border-top:1px solid var(--vien)">
+                <form id="form-mon" class="row g-2">
+                    <div class="col-7">
+                        <input type="text" class="form-control form-control-sm"
+                               id="m-ten" placeholder="Tên món" required>
+                    </div>
+                    <div class="col-5">
+                        <input type="number" class="form-control form-control-sm"
+                               id="m-gia" placeholder="Giá (VND)" min="0">
+                    </div>
+                    <div class="col-12">
+                        <input type="text" class="form-control form-control-sm"
+                               id="m-mo-ta" placeholder="Ghi chú (không bắt buộc)">
+                    </div>
+                    <div class="col-12">
+                        <button class="nut-vien w-100">+ Thêm món</button>
+                    </div>
+                </form>
             </div>
         </div>
 
         <!-- REVIEW -->
-        <div class="col-lg-7">
-            <div class="card shadow-sm mb-3">
-                <div class="card-header bg-white fw-semibold">✍️ Viết bài review</div>
-                <div class="card-body">
+        <div>
+            <div class="hop-trang">
+                <div class="dau-hop">✍️ Viết bài review</div>
+                <div class="than-hop">
                     <form id="form-review">
                         <div class="row g-2">
                             <div class="col-md-7">
@@ -420,11 +499,11 @@ function htmlChiTiet(q) {
                             </div>
                             <div class="col-md-5">
                                 <select class="form-select" id="r-diem" required>
-                                    <option value="5">⭐⭐⭐⭐⭐ Tuyệt vời</option>
-                                    <option value="4">⭐⭐⭐⭐ Ngon</option>
-                                    <option value="3" selected>⭐⭐⭐ Bình thường</option>
-                                    <option value="2">⭐⭐ Tạm được</option>
-                                    <option value="1">⭐ Không ngon</option>
+                                    <option value="5">★★★★★ Tuyệt vời</option>
+                                    <option value="4">★★★★ Ngon</option>
+                                    <option value="3" selected>★★★ Bình thường</option>
+                                    <option value="2">★★ Tạm được</option>
+                                    <option value="1">★ Không ngon</option>
                                 </select>
                             </div>
                             <div class="col-12">
@@ -432,57 +511,199 @@ function htmlChiTiet(q) {
                                           placeholder="Cảm nhận của bạn về quán này..."></textarea>
                             </div>
                             <div class="col-12">
-                                <button class="btn btn-danger w-100">Đăng bài review</button>
+                                <button class="nut-do w-100">Đăng bài review</button>
                             </div>
                         </div>
                     </form>
                 </div>
             </div>
 
-            <h5 class="mb-3">Bài review (${q.reviews.length})</h5>
+            <div class="dau-hop" style="background:#fff;border:1px solid var(--vien);margin-bottom:10px">
+                Bài review (${q.reviews.length})
+            </div>
             <div id="khung-reviews">
                 ${q.reviews.length === 0
-                    ? `<p class="text-secondary">Chưa có bài review nào. Hãy là người đầu tiên!</p>`
+                    ? `<div class="khong-co-gi">Chưa có bài review nào. Hãy là người đầu tiên!</div>`
                     : q.reviews.map(theReview).join("")}
             </div>
         </div>
     </div>`;
 }
 
+/** Lưới ảnh không gian quán. */
+function khoiThuVien(q) {
+    const anhList = q.thu_vien || [];
+    if (anhList.length === 0) {
+        return `
+    <div class="hop-trang">
+        <div class="than-hop ghi-chu text-center">
+            📷 Quán này chưa có ảnh nào.
+            Bấm <strong>Đăng ảnh quán</strong> ở trên để người đọc thấy quán trông thế nào.
+        </div>
+    </div>`;
+    }
+
+    const o = anhList.map(a => {
+        const laBia = a.ten_file === q.anh;
+        return `
+        <div class="o-thu-vien ${laBia ? "la-bia" : ""}">
+            <img src="/uploads/${encodeURIComponent(a.ten_file)}"
+                 class="anh-thu-vien" loading="lazy"
+                 alt="Ảnh quán ${thoat(q.ten)}"
+                 onclick="xemAnhLon('${encodeURIComponent(a.ten_file)}')">
+            <div class="chan-thu-vien">
+                ${laBia
+                    ? `<span class="nhan-bia">Ảnh bìa</span>`
+                    : `<button class="lien-ket-nho" onclick="datAnhBia(${q.id}, ${a.id})">Đặt làm bìa</button>`}
+                <button class="lien-ket-nho do ms-2" onclick="xoaAnhThuVien(${a.id})">Xoá</button>
+            </div>
+        </div>`;
+    }).join("");
+
+    return `
+    <div class="hop-trang">
+        <div class="dau-hop">📷 Ảnh quán (${anhList.length})</div>
+        <div class="than-hop">
+            <div class="luoi-thu-vien">${o}</div>
+        </div>
+    </div>`;
+}
+
+/** Mở ảnh ở kích thước đầy đủ trong tab mới. */
+function xemAnhLon(tenFileDaMaHoa) {
+    window.open(`/uploads/${tenFileDaMaHoa}`, "_blank", "noopener");
+}
+
+/** Tải một hoặc nhiều ảnh quán lên thư viện. */
+async function taiAnhQuan(quanId, input) {
+    const files = Array.from(input.files || []);
+    if (files.length === 0) return;
+
+    for (const f of files) {
+        const loi = loiCuaAnh(f);
+        if (loi) {
+            hienThongBao(`${f.name}: ${loi}`, "danger");
+            input.value = "";
+            return;
+        }
+    }
+
+    const form = new FormData();
+    // Tên trường phải là "files" để khớp tham số List[UploadFile] ở máy chủ
+    files.forEach(f => form.append("files", f));
+
+    hienThongBao(`Đang tải ${files.length} ảnh lên...`, "secondary");
+    const kq = await goiApi(`/api/quan/${quanId}/thu-vien`, {
+        method: "POST",
+        body: form,
+    });
+    input.value = "";  // cho phép chọn lại đúng file đó lần sau
+    if (!kq) return;
+
+    hienThongBao(`Đã đăng ${files.length} ảnh.`);
+    moChiTiet(quanId);
+}
+
+async function datAnhBia(quanId, anhId) {
+    const kq = await goiApi(`/api/quan/${quanId}/anh-bia/${anhId}`, { method: "PUT" });
+    if (!kq) return;
+    hienThongBao("Đã đặt làm ảnh bìa.");
+    moChiTiet(quanId);
+}
+
+async function boAnhBia(quanId) {
+    const kq = await goiApi(`/api/quan/${quanId}/anh`, { method: "DELETE" });
+    if (!kq) return;
+    hienThongBao("Đã bỏ ảnh bìa. Ảnh vẫn còn trong thư viện.");
+    moChiTiet(quanId);
+}
+
+async function xoaAnhThuVien(anhId) {
+    if (!confirm("Xoá hẳn ảnh này khỏi thư viện?")) return;
+    const kq = await goiApi(`/api/thu-vien/${anhId}`, { method: "DELETE" });
+    if (!kq) return;
+    hienThongBao("Đã xoá ảnh.");
+    moChiTiet(quanHienTai);
+}
+
+// ---- Menu ----
+
 function dongMenu(m) {
+    if (monDangSua === m.id) return dongMenuDangSua(m);
+
     const anh = m.anh
         ? `<img src="/uploads/${encodeURIComponent(m.anh)}" alt="${thoat(m.ten_mon)}"
                 class="anh-mon" loading="lazy">`
         : `<div class="anh-mon anh-trong d-flex align-items-center justify-content-center">🍽️</div>`;
 
     return `
-        <li class="list-group-item d-flex justify-content-between align-items-start gap-2">
+        <div class="dong-mon">
             ${anh}
-            <div class="flex-grow-1">
-                <div class="fw-semibold">${thoat(m.ten_mon)}</div>
-                ${m.mo_ta ? `<div class="small text-secondary">${thoat(m.mo_ta)}</div>` : ""}
-                <label class="small text-danger mb-0" role="button">
+            <div class="flex-grow-1 min-width-0">
+                <div class="fw-bold">${thoat(m.ten_mon)}</div>
+                ${m.mo_ta ? `<div class="ghi-chu">${thoat(m.mo_ta)}</div>` : ""}
+                <label class="lien-ket-nho do" style="cursor:pointer">
                     ${m.anh ? "Đổi ảnh" : "+ Ảnh"}
                     <input type="file" accept="image/*" class="d-none"
                            onchange="taiAnh('menu', ${m.id}, this)">
                 </label>
-                ${m.anh ? `<span class="small text-secondary ms-2" role="button"
-                                 onclick="goAnh('menu', ${m.id})">Xoá ảnh</span>` : ""}
+                ${m.anh ? `<button class="lien-ket-nho ms-2" onclick="goAnh('menu', ${m.id})">Xoá ảnh</button>` : ""}
             </div>
             <div class="text-end">
-                <div class="badge bg-light text-dark border">${dinhDangGia(m.gia)}</div>
-                <button class="btn btn-sm btn-link text-danger p-0 ms-1"
-                        onclick="xoaMon(${m.id})" title="Xoá món">&times;</button>
+                <div class="gia-mon">${dinhDangGia(m.gia)}</div>
+                <div class="mt-1">
+                    <button class="lien-ket-nho" onclick="moSuaMon(${m.id})">Sửa</button>
+                    <button class="lien-ket-nho do ms-2" onclick="xoaMon(${m.id})">Xoá</button>
+                </div>
             </div>
-        </li>`;
+        </div>`;
 }
 
-// ---- Tải / gỡ ảnh ----
+/** Dòng menu ở chế độ sửa: đổi tên, giá và ghi chú của món đã lưu. */
+function dongMenuDangSua(m) {
+    return `
+        <div class="dong-mon" style="background:#fafafa">
+            <form class="row g-2 w-100" data-sua-mon="${m.id}">
+                <div class="col-7">
+                    <input type="text" class="form-control form-control-sm"
+                           name="ten_mon" value="${thoat(m.ten_mon)}" required>
+                </div>
+                <div class="col-5">
+                    <input type="number" class="form-control form-control-sm" min="0"
+                           name="gia" placeholder="Giá (VND)"
+                           value="${m.gia === null || m.gia === undefined ? "" : m.gia}">
+                </div>
+                <div class="col-12">
+                    <input type="text" class="form-control form-control-sm"
+                           name="mo_ta" placeholder="Ghi chú" value="${thoat(m.mo_ta)}">
+                </div>
+                <div class="col-12 d-flex gap-2">
+                    <button class="nut-do flex-grow-1">Lưu</button>
+                    <button type="button" class="nut-vien" onclick="huySuaMon()">Huỷ</button>
+                </div>
+            </form>
+        </div>`;
+}
 
-/** loai: "quan" hoặc "menu". Gửi file bằng FormData. */
+function moSuaMon(id) {
+    monDangSua = id;
+    moChiTiet(quanHienTai);
+}
+
+function huySuaMon() {
+    monDangSua = null;
+    moChiTiet(quanHienTai);
+}
+
+// ---- Tải / gỡ ảnh món ----
+
+/** loai: "menu". Gửi file bằng FormData. */
 async function taiAnh(loai, id, input) {
     const file = input.files[0];
     if (!file) return;
+
+    const loi = loiCuaAnh(file);
+    if (loi) { hienThongBao(loi, "danger"); input.value = ""; return; }
 
     const form = new FormData();
     form.append("file", file);
@@ -505,24 +726,75 @@ async function goAnh(loai, id) {
     moChiTiet(quanHienTai);
 }
 
+// ---- Bài review ----
+
 function theReview(r) {
+    if (reviewDangSua === r.id) return theReviewDangSua(r);
+
+    // Chỉ hiện mốc sửa khi bài review thực sự đã từng được sửa
+    const dauSua = r.ngay_cap_nhat
+        ? ` · <em>đã sửa ${thoat(r.ngay_cap_nhat)}</em>`
+        : "";
+
     return `
-        <div class="card mb-2 shadow-sm">
-            <div class="card-body py-3">
-                <div class="d-flex justify-content-between align-items-start">
+        <div class="the-review">
+            <div class="d-flex justify-content-between align-items-start">
+                <div class="d-flex gap-2 align-items-center">
+                    <div class="anh-dai-dien">${thoat(chuDau(r.nguoi_viet))}</div>
                     <div>
                         <strong>${thoat(r.nguoi_viet)}</strong>
-                        <span class="text-warning ms-1">${veSao(r.diem)}</span>
+                        <span class="sao-vang ms-1">${veSao(r.diem)}</span>
                     </div>
-                    <button class="btn btn-sm btn-link text-danger p-0"
-                            onclick="xoaReview(${r.id})" title="Xoá review">&times;</button>
                 </div>
-                ${r.noi_dung
-                    ? `<p class="mb-1 mt-2">${thoat(r.noi_dung)}</p>`
-                    : `<p class="mb-1 mt-2 text-secondary"><em>Không có nội dung</em></p>`}
-                <small class="text-muted">${r.ngay_tao}</small>
+                <div class="text-nowrap">
+                    <button class="lien-ket-nho" onclick="moSuaReview(${r.id})">Sửa</button>
+                    <button class="lien-ket-nho do ms-2" onclick="xoaReview(${r.id})">Xoá</button>
+                </div>
             </div>
+            ${r.noi_dung
+                ? `<p class="mb-1 mt-2">${thoat(r.noi_dung)}</p>`
+                : `<p class="mb-1 mt-2 ghi-chu"><em>Không có nội dung</em></p>`}
+            <div class="moc-thoi-gian">${thoat(r.ngay_tao)}${dauSua}</div>
         </div>`;
+}
+
+/** Bài review ở chế độ sửa. Lưu xong máy chủ sẽ ghi lại ngày giờ cập nhật. */
+function theReviewDangSua(r) {
+    const chonDiem = [5, 4, 3, 2, 1]
+        .map(d => `<option value="${d}" ${d === r.diem ? "selected" : ""}>${veSao(d)}</option>`)
+        .join("");
+
+    return `
+        <div class="the-review dang-sua">
+            <form class="row g-2" data-sua-review="${r.id}">
+                <div class="col-md-7">
+                    <input type="text" class="form-control" name="nguoi_viet"
+                           value="${thoat(r.nguoi_viet)}"
+                           placeholder="Tên của bạn (để trống = Ẩn danh)">
+                </div>
+                <div class="col-md-5">
+                    <select class="form-select" name="diem" required>${chonDiem}</select>
+                </div>
+                <div class="col-12">
+                    <textarea class="form-control" name="noi_dung" rows="3"
+                              placeholder="Cảm nhận của bạn về quán này...">${thoat(r.noi_dung)}</textarea>
+                </div>
+                <div class="col-12 d-flex gap-2">
+                    <button class="nut-do flex-grow-1">Lưu thay đổi</button>
+                    <button type="button" class="nut-vien" onclick="huySuaReview()">Huỷ</button>
+                </div>
+            </form>
+        </div>`;
+}
+
+function moSuaReview(id) {
+    reviewDangSua = id;
+    moChiTiet(quanHienTai);
+}
+
+function huySuaReview() {
+    reviewDangSua = null;
+    moChiTiet(quanHienTai);
 }
 
 // Form trong màn chi tiết được tạo động nên phải gắn sự kiện lại sau mỗi lần render
@@ -560,6 +832,61 @@ function ganSuKienFormChiTiet(quanId) {
         moChiTiet(quanId);
         capNhatThongKe();
     });
+
+    // Nút Xoá quán: tên quán đi qua dataset nên không bao giờ được diễn giải
+    // như mã JavaScript, khác với cách nhúng thẳng vào onclick trước đây
+    const nutXoaQuan = document.querySelector("[data-xoa-quan]");
+    if (nutXoaQuan) {
+        nutXoaQuan.addEventListener("click", () =>
+            xoaQuan(Number(nutXoaQuan.dataset.xoaQuan), nutXoaQuan.dataset.ten)
+        );
+    }
+
+    // Form sửa món: chỉ có mặt khi đang mở chế độ sửa một món
+    const formSuaMon = document.querySelector("[data-sua-mon]");
+    if (formSuaMon) {
+        formSuaMon.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const f = new FormData(formSuaMon);
+            const giaRaw = f.get("gia");
+            const kq = await goiApi(`/api/menu/${formSuaMon.dataset.suaMon}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    ten_mon: f.get("ten_mon").trim(),
+                    gia: giaRaw === "" ? null : parseInt(giaRaw, 10),
+                    mo_ta: f.get("mo_ta").trim(),
+                }),
+            });
+            if (!kq) return;
+            monDangSua = null;
+            hienThongBao("Đã cập nhật món.");
+            moChiTiet(quanId);
+        });
+    }
+
+    // Form sửa review: chỉ có mặt khi đang mở chế độ sửa một bài review
+    const formSuaReview = document.querySelector("[data-sua-review]");
+    if (formSuaReview) {
+        formSuaReview.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const f = new FormData(formSuaReview);
+            const kq = await goiApi(`/api/reviews/${formSuaReview.dataset.suaReview}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    nguoi_viet: f.get("nguoi_viet").trim() || "Ẩn danh",
+                    diem: parseInt(f.get("diem"), 10),
+                    noi_dung: f.get("noi_dung").trim(),
+                }),
+            });
+            if (!kq) return;
+            reviewDangSua = null;
+            hienThongBao(`Đã cập nhật bài review lúc ${kq.ngay_cap_nhat}.`);
+            moChiTiet(quanId);
+            capNhatThongKe();
+        });
+    }
 }
 
 async function xoaMon(id) {
@@ -580,4 +907,15 @@ async function xoaReview(id) {
 }
 
 // ===================== Khởi động =====================
-document.addEventListener("DOMContentLoaded", moTrangChu);
+
+// Tab sắp xếp: lọc ngay trên dữ liệu đang có, không gọi lại máy chủ
+document.getElementById("nhom-tab").addEventListener("click", (e) => {
+    const nut = e.target.closest(".tab");
+    if (!nut) return;
+    document.querySelectorAll("#nhom-tab .tab")
+        .forEach(t => t.classList.toggle("dang-chon", t === nut));
+    sapXep = nut.dataset.sapXep;
+    veLuoiQuan();
+});
+
+document.addEventListener("DOMContentLoaded", () => moDanhSach(null));
